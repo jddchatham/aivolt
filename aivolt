@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -u
+
+project_dir="$HOME/Desktop/a.i. tang engineering"
+bitstream="$project_dir/ai_volt_meter_autorange.fs"
+meter="$project_dir/ai_volt_meter.py"
+
+printf '\nAI Volt Meter\n'
+printf '15 V maximum. Never connect mains or a running vehicle/alternator.\n\n'
+printf 'Loading the auto-ranging FPGA design into SRAM...\n'
+
+if ! openFPGALoader -b tangprimer25k "$bitstream"; then
+  printf '\nFPGA loading failed. Check USB/JTAG, then try again.\n'
+  printf 'Press Enter to close.'
+  read -r
+  exit 1
+fi
+
+printf '\nFPGA loaded successfully. Starting the meter...\n\n'
+printf 'Please connect the Tang, ADS1115, divider, and source as follows:\n\n'
+printf '  Tang 3V3  -> ADS1115 VDD\n'
+printf '  Tang GND  -> ADS1115 GND and ADS1115 ADDR\n'
+printf '  Tang K11  -> ADS1115 SDA\n'
+printf '  Tang L11  -> ADS1115 SCL\n'
+printf '  Divider S -> ADS1115 A0\n'
+printf '  Divider - -> ADS1115 GND\n'
+printf '  Divider + -> leave disconnected\n\n'
+printf 'Now connect what you are measuring:\n\n'
+printf '  Source positive (+) -> divider screw terminal VCC\n'
+printf '  Source negative (-) -> divider screw terminal GND\n\n'
+printf 'For the first test, use only the 1.5 V battery.\n'
+printf 'Confirm polarity. Maximum 15 V; never mains or a running vehicle.\n'
+printf 'When everything is secure, press Enter to measure.\n'
+read -r
+
+printf 'Waiting for /dev/ttyUSB1...\n'
+serial_ready=0
+for attempt in {1..10}; do
+  if [[ -e /dev/ttyUSB1 ]]; then
+    serial_ready=1
+    break
+  fi
+  sleep 1
+done
+
+if [[ $serial_ready -eq 0 ]]; then
+  printf '\nThe serial port /dev/ttyUSB1 did not appear.\n'
+  printf 'Reconnect USB, verify the board, and run AI Volt again.\n'
+  meter_status=1
+else
+  meter_status=0
+  while true; do
+    python "$meter"
+    meter_status=$?
+    printf '\nThe FPGA remains active; three lights and a blinking middle light are normal.\n'
+    printf 'Measure another item without unplugging the Tang? [y/N]: '
+    read -r measure_again
+    if [[ ! "$measure_again" =~ ^[Yy]$ ]]; then
+      break
+    fi
+    printf '\nDisconnect only the previous measured source from the divider.\n'
+    printf 'Leave the Tang-to-ADS1115 wiring connected.\n'
+    printf 'Connect the new source with correct polarity, maximum 15 V.\n'
+    printf 'When the new connection is secure, press Enter.\n'
+    read -r
+  done
+fi
+
+printf '\nAI Volt finished. Press Enter to close this window.\n'
+read -r
+exit "$meter_status"

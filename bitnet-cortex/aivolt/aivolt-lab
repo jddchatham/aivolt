@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+# AI Volt Lab — dashboard front end for the Tang Primer 25K / ADS1115 voltmeter.
+set -u
+
+PROJECT_DIR="$HOME/Desktop/a.i. tang engineering"
+METER="$PROJECT_DIR/ai_volt_meter.py"
+DB="$PROJECT_DIR/voltage_fingerprints.sqlite3"
+PROVEN_BITSTREAM="$PROJECT_DIR/ai_volt_meter.fs"
+AUTORANGE_BITSTREAM="$PROJECT_DIR/ai_volt_meter_autorange.fs"
+SERIAL_DEVICE="/dev/ttyUSB1"
+STATE_FILE="/tmp/aivolt-lab.$(id -u).state"
+
+PRIMARY="212"
+ACCENT="99"
+OK="82"
+WARN="214"
+BAD="196"
+MUTED="245"
+
+pause() { gum input --placeholder "Press Enter to continue" >/dev/null; }
+
+header() {
+  clear
+  gum style --border double --border-foreground "$PRIMARY" --padding "0 2" \
+    --margin "0 0 1 0" --align center --width 60 --bold \
+    "AI VOLT LAB" "Tang Primer 25K · ADS1115 · Fingerprint Engine"
+}
+
+status_panel() {
+  local serial_badge fpga_badge db_badge count=0
+  if [[ -e "$SERIAL_DEVICE" ]]; then
+    serial_badge=$(gum style --foreground "$OK" "● serial: connected")
+  else
+    serial_badge=$(gum style --foreground "$BAD" "● serial: absent")
+  fi
+
+  if [[ -f "$STATE_FILE" ]]; then
+    fpga_badge=$(gum style --foreground "$OK" "● fpga: $(cat "$STATE_FILE")")
+  else
+    fpga_badge=$(gum style --foreground "$WARN" "● fpga: not loaded this session")
+  fi
+
+  [[ -f "$DB" ]] && count=$(sqlite3 "$DB" "SELECT COUNT(*) FROM fingerprints;" 2>/dev/null || echo 0)
+  db_badge=$(gum style --foreground "$ACCENT" "● fingerprints: $count")
+
+  gum join --horizontal "$serial_badge" "   " "$fpga_badge" "   " "$db_badge"
+  gum style --foreground "$MUTED" "15 V max — never mains or a running vehicle/alternator"
+  echo
+}
+
+load_bitstream_menu() {
+  header
+  local choice
+  choice=$(gum choose --header "Which bitstream?" \
+    "Proven — ai_volt_meter.fs (known-good, fixed range, ~10 V max)" \
+    "Auto-ranging — ai_volt_meter_autorange.fs (0-15 V, three ranges)" \
+    "Back")
+  local bitstream="" label=""
+  case "$choice" in
+    Proven*) bitstream="$PROVEN_BITSTREAM"; label="proven" ;;
+    Auto-ranging*) bitstream="$AUTORANGE_BITSTREAM"; label="autorange" ;;
+    *) return ;;
+  esac
+
+  if gum spin --spinner dot --title "Loading $label bitstream via JTAG..." --show-error -- \
+      openFPGALoader -b tangprimer25k "$bitstream"; then
+    echo "$label ($(date '+%H:%M:%S'))" > "$STATE_FILE"
+    gum style --foreground "$OK" "✓ $label bitstream loaded into SRAM."
+  else
+    gum style --foreground "$BAD" "✗ FPGA load failed. Check USB/JTAG and try again."
+  fi
+  pause
+}
+
+take_reading() {
+  header
+  if [[ ! -e "$SERIAL_DEVICE" ]]; then
+    gum style --foreground "$WARN" "Waiting for $SERIAL_DEVICE..."
+    for _ in {1..10}; do
+      [[ -e "$SERIAL_DEVICE" ]] && break
+      sleep 1
+    done
+  fi
+  if [[ ! -e "$SERIAL_DEVICE" ]]; then
+    gum style --foreground "$BAD" "✗ $SERIAL_DEVICE never appeared. Load the bitstream and check the USB cable."
+    pause
+    return
+  fi
+  gum style --foreground "$ACCENT" --bold "Starting measurement — 15 V max, never mains or a running vehicle."
+  echo
+  python3 "$METER"
+  echo
+  gum style --foreground "$MUTED" "Measurement session ended."
+  pause
+}
+
+trend_sparkline() {
+  local identity="$1" escaped values
+  escaped=${identity//\'/\'\'}
+  values=$(sqlite3 "$DB" \
+    "SELECT CASE WHEN average_voltage IS NOT NULL THEN average_voltage ELSE volts END
+     FROM fingerprints WHERE identity='$escaped' ORDER BY id;")
+  [[ -z "$values" ]] && return
+  python3 - "$values" <<'PYEOF'
+import sys
+vals = [float(x) for x in sys.argv[1].split()]
+blocks = "▁▂▃▄▅▆▇█"
+lo, hi = min(vals), max(vals)
+span = (hi - lo) or 1.0
+spark = "".join(blocks[min(int((v - lo) / span * (len(blocks) - 1)), len(blocks) - 1)] for v in vals)
+print(f"trend:  {spark}   (min {lo:.3f} V, max {hi:.3f} V, n={len(vals)})")
+PYEOF
+}
+
+show_identity_history() {
+  local identity="$1" escaped
+  escaped=${identity//\'/\'\'}
+  header
+  gum style --bold --foreground "$ACCENT" "Fingerprint history: $identity"
+  echo
+  sqlite3 -header -column "$DB" \
+    "SELECT measured_at AS time,
+            CASE WHEN average_voltage IS NOT NULL THEN printf('%.4f', average_voltage)
+                 ELSE printf('%.4f', volts) END AS volts,
+            sample_count AS n,
+            CASE WHEN stability IS NOT NULL THEN printf('%.4f', stability) ELSE '—' END AS stdev,
+            status
+     FROM fingerprints WHERE identity='$escaped' ORDER BY id;"
+  echo
+  trend_sparkline "$identity"
+  echo
+  pause
+}
+
+history_menu() {
+  header
+  if [[ ! -f "$DB" ]]; then
+    gum style --foreground "$WARN" "No database yet — take a measurement first."
+    pause
+    return
+  fi
+  mapfile -t identities < <(sqlite3 "$DB" "SELECT DISTINCT identity FROM fingerprints ORDER BY identity;")
+  if [[ ${#identities[@]} -eq 0 ]]; then
+    gum style --foreground "$WARN" "No fingerprints recorded yet."
+    pause
+    return
+  fi
+  local pick
+  pick=$(printf '%s\n' "${identities[@]}" | gum choose --header "Select an item to inspect" --height 15)
+  [[ -z "$pick" ]] && return
+  show_identity_history "$pick"
+}
+
+live_stream() {
+  header
+  if [[ ! -e "$SERIAL_DEVICE" ]]; then
+    gum style --foreground "$BAD" "✗ $SERIAL_DEVICE not present."
+    pause
+    return
+  fi
+  stty -F "$SERIAL_DEVICE" 115200 cs8 -cstopb -parenb raw -echo
+  gum style --foreground "$ACCENT" "Streaming raw ADC codes from $SERIAL_DEVICE — Ctrl+C to stop."
+  echo
+  trap 'true' INT
+  cat "$SERIAL_DEVICE"
+  trap - INT
+  echo
+  pause
+}
+
+diagnostics() {
+  header
+  gum style --bold --foreground "$ACCENT" "Hardware diagnostics"
+  echo
+  echo "USB serial adapter (expect 0403:6010 FTDI):"
+  if lsusb | grep -qi "0403:6010"; then
+    gum style --foreground "$OK" "  ✓ FTDI adapter found"
+  else
+    gum style --foreground "$WARN" "  ✗ not found in lsusb"
+  fi
+  echo
+  echo "Serial devices:"
+  ls -l /dev/ttyUSB0 /dev/ttyUSB1 2>/dev/null || gum style --foreground "$WARN" "  none present"
+  echo
+  if gum confirm "Run FPGA JTAG detect now? (board must be connected)"; then
+    gum spin --spinner dot --title "Probing JTAG..." --show-output -- openFPGALoader --detect
+  fi
+  echo
+  pause
+}
+
+db_summary() {
+  header
+  gum style --bold --foreground "$ACCENT" "Database summary"
+  echo
+  if [[ ! -f "$DB" ]]; then
+    gum style --foreground "$WARN" "No database yet."
+  else
+    sqlite3 -header -column "$DB" \
+      "SELECT identity, COUNT(*) AS readings, MAX(measured_at) AS last_seen
+       FROM fingerprints GROUP BY identity ORDER BY last_seen DESC;"
+    echo
+    local total
+    total=$(sqlite3 "$DB" "SELECT COUNT(*) FROM fingerprints;")
+    gum style --foreground "$MUTED" "Total fingerprint records: $total   —   $DB"
+  fi
+  echo
+  pause
+}
+
+main_menu() {
+  while true; do
+    header
+    status_panel
+    choice=$(gum choose --header "Select an action" --height 12 \
+      "Load FPGA bitstream" \
+      "Take a fingerprint reading" \
+      "Browse fingerprint history" \
+      "Live raw ADC stream" \
+      "Hardware diagnostics" \
+      "Database summary" \
+      "Quit")
+    case "$choice" in
+      "Load FPGA bitstream") load_bitstream_menu ;;
+      "Take a fingerprint reading") take_reading ;;
+      "Browse fingerprint history") history_menu ;;
+      "Live raw ADC stream") live_stream ;;
+      "Hardware diagnostics") diagnostics ;;
+      "Database summary") db_summary ;;
+      "Quit"|"") break ;;
+    esac
+  done
+  header
+  gum style --foreground "$MUTED" "AI Volt Lab closed. FPGA SRAM stays loaded until the board is power-cycled."
+}
+
+if ! command -v gum >/dev/null 2>&1; then
+  echo "gum is required for AI Volt Lab (https://github.com/charmbracelet/gum)." >&2
+  exit 1
+fi
+
+main_menu
